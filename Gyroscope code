@@ -1,0 +1,154 @@
+#define USE_CLOCK
+#define USE_I2C_USCI
+#define USE_MPU6050
+#define USE_UART
+
+#include <wchar.h>
+#include "stdio.h"
+#include "Library/mymath.h"
+#include <math.h>
+#include "msp430g2553.h"
+#include "Library/Global.h"
+#include "Library/UART.h"
+#include "Library/Clock.h"
+#include "Library/I2C_USCI.h"
+#include "Library/MPU6050.h"
+
+#define RAD2DEG(x) ((x) * 57.2957795f)
+
+// --- Angle thresholds (deg) ---
+#define ROLL_ON_DEG     80.0f   // enter ON/BLINK at/above |80°| (hysteresis)
+#define ROLL_OFF_DEG    70.0f   // leave ON/BLINK below |70°|
+
+// --- Blink timing (ms) ---
+#define BLINK_PERIOD_MS 300
+#define TICK_MS         1
+
+typedef enum {
+    LED_MODE_OFF = 0,
+    LED_MODE_SOLID,
+    LED_MODE_BLINK
+} led_mode_t;
+
+// ---------- FLAGS (visible anywhere) ----------
+volatile unsigned char toLeft  = 0;   // 1 only when roll <= -90°
+volatile unsigned char toRight = 0;   // 1 only when roll >= +90°
+// ---------------------------------------------
+
+static inline float compute_roll_deg(void) {
+    // roll = atan2(Ay, Az). If orientation is flipped, negate the return value.
+    float ay = (float)ACCEL_YOUT;
+    float az = (float)ACCEL_ZOUT;
+    return RAD2DEG(atan2f(ay, az));
+}
+
+void main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    Select_Clock(DCO_16MHZ);
+    _delay_cycles(100000);
+
+    // LED on P1.0
+    P1DIR |= BIT0;
+    P1OUT &= ~BIT0;
+
+    UART_Init();
+    _delay_cycles(100000);
+
+    Init_I2C_USCI(MPU6050_ADDRESS);
+    Setup_MPU6050();
+    _delay_cycles(320000);
+
+    // Optional clears from original
+    Get_Accel_Values();
+    ACCEL_XOUT = ACCEL_YOUT = ACCEL_ZOUT = 0;
+    ACCEL_XOUT_PAST = ACCEL_YOUT_PAST = ACCEL_ZOUT_PAST = 0;
+    ACCEL_XA = ACCEL_YA = ACCEL_ZA = 0;
+    ACCEL_XV = ACCEL_YV = ACCEL_ZV = 0;
+    ACCEL_XDECAC = ACCEL_YDECAC = ACCEL_ZDECAC = 0;
+
+    _delay_cycles(1000000);
+
+    led_mode_t mode = LED_MODE_OFF;
+    unsigned char led_state = 0;
+    unsigned int  blink_ms  = 0;
+
+    while (1)
+    {
+        // 1) Read sensor and compute roll angle
+        Get_Accel_Values();
+        float roll_deg = compute_roll_deg();
+
+        // 2) Update flags EXACTLY for +/-90° or more (no hysteresis)
+        //    These reflect your requirement “only set when 90° or more”
+        toLeft  = (roll_deg <= -90.0f) ? 1 : 0;
+        toRight = (roll_deg >= +90.0f) ? 1 : 0;
+
+        // 3) Decide LED mode with hysteresis for stability
+        switch (mode) {
+            case LED_MODE_OFF:
+                if (roll_deg >= ROLL_ON_DEG) {
+                    mode = LED_MODE_SOLID;              // right ~90°
+                    P1OUT |= BIT0;
+                    led_state = 1;
+                } else if (roll_deg <= -ROLL_ON_DEG) {
+                    mode = LED_MODE_BLINK;              // left ~90°
+                    blink_ms = 0;
+                    led_state = 0;
+                    P1OUT &= ~BIT0;
+                } else {
+                    P1OUT &= ~BIT0;
+                    led_state = 0;
+                }
+                break;
+
+            case LED_MODE_SOLID:
+                if (roll_deg < ROLL_OFF_DEG && roll_deg > -ROLL_OFF_DEG) {
+                    mode = LED_MODE_OFF;
+                    P1OUT &= ~BIT0;
+                    led_state = 0;
+                } else if (roll_deg <= -ROLL_ON_DEG) {
+                    mode = LED_MODE_BLINK;
+                    blink_ms = 0;
+                    led_state = 0;
+                    P1OUT &= ~BIT0;
+                } else {
+                    P1OUT |= BIT0;   // stay solid
+                    led_state = 1;
+                }
+                break;
+
+            case LED_MODE_BLINK:
+                if (roll_deg > -ROLL_OFF_DEG && roll_deg < ROLL_OFF_DEG) {
+                    mode = LED_MODE_OFF;
+                    P1OUT &= ~BIT0;
+                    led_state = 0;
+                } else if (roll_deg >= ROLL_ON_DEG) {
+                    mode = LED_MODE_SOLID;
+                    P1OUT |= BIT0;
+                    led_state = 1;
+                } else {
+                    // continue blinking (handled below)
+                }
+                break;
+        }
+
+        // 4) Blink timing when in BLINK mode
+        if (mode == LED_MODE_BLINK) {
+            blink_ms += TICK_MS;
+            if (blink_ms >= (BLINK_PERIOD_MS / 2)) {
+                blink_ms = 0;
+                led_state ^= 1;
+                if (led_state) P1OUT |= BIT0;
+                else           P1OUT &= ~BIT0;
+            }
+        }
+
+        // ~1 ms loop tick @ 16 MHz
+        _delay_cycles(16000);
+    }
+}
+
+// Unused ISR
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void Timer_A0 (void) { }
